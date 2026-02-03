@@ -1,18 +1,31 @@
 """Pytest configuration and shared fixtures."""
 
+import os
+import tempfile
+import atexit
+
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.core.database import Base, get_db
-from app.main import app
-from app.models.task import Task, TaskStatus
+# ─── Test Database Setup (SQLite file for concurrent access) ────────────────
+# Using file instead of :memory: to allow concurrent sessions in batch processing
 
-# ─── Test Database Setup (SQLite in memory for faster tests) ────────────────
+# Create temporary database file
+test_db_file = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
+test_db_file.close()
+TEST_DB_URL = f"sqlite+aiosqlite:///{test_db_file.name}"
 
-TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
+# Clean up temp file on exit
+def cleanup_test_db():
+    try:
+        os.remove(test_db_file.name)
+    except:
+        pass
+
+atexit.register(cleanup_test_db)
 
 test_engine = create_async_engine(TEST_DB_URL, echo=False)
 TestSessionFactory = sessionmaker(
@@ -20,6 +33,15 @@ TestSessionFactory = sessionmaker(
     class_=AsyncSession,
     expire_on_commit=False,
 )
+
+# Override async_session_factory BEFORE importing app modules
+# This ensures batch processing uses test database
+from app.core import database
+database.async_session_factory = TestSessionFactory
+
+from app.core.database import Base, get_db
+from app.main import app
+from app.models.task import Task, TaskStatus
 
 
 # ─── Override get_db dependency ──────────────────────────────────────────────
@@ -43,11 +65,19 @@ app.dependency_overrides[get_db] = override_get_db
 @pytest_asyncio.fixture(autouse=True)
 async def setup_db():
     """Create tables before each test and drop them after."""
+    # Drop all tables first to ensure clean state
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    # Create tables
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield
+    # Clean up after test - delete all data
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
+    # Also clear the file content by recreating tables
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
 
 @pytest.fixture
